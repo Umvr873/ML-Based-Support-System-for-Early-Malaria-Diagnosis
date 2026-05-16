@@ -181,6 +181,21 @@ st.markdown(
         color: #052e16 !important;
     }
 
+    .result-card-invalid {
+        background: linear-gradient(135deg, #fff7ed, #ffedd5);
+        border-left: 8px solid #f97316;
+        padding: 1.45rem;
+        border-radius: 20px;
+        box-shadow: 0px 8px 28px rgba(249, 115, 22, 0.13);
+        color: #431407 !important;
+    }
+
+    .result-card-invalid h2,
+    .result-card-invalid h3,
+    .result-card-invalid p {
+        color: #431407 !important;
+    }
+
     /* =========================
        WARNING / ALERTS
        ========================= */
@@ -435,6 +450,86 @@ def predict_malaria(image: Image.Image):
     return label, confidence, parasitized_prob, uninfected_prob, probability
 
 
+def validate_blood_smear_image(image: Image.Image):
+    """
+    Basic out-of-scope image validation.
+    This does not replace a dedicated blood-smear detector, but it helps prevent
+    obvious invalid uploads such as selfies, documents, landscapes, dark images,
+    blank images, and grayscale/non-microscopy images.
+    """
+    try:
+        rgb_img = image.convert("RGB").resize((224, 224))
+        img = np.array(rgb_img)
+
+        # Basic image quality checks
+        mean_intensity = np.mean(img)
+        std_intensity = np.std(img)
+
+        if mean_intensity < 25:
+            return False, "The uploaded image is too dark for reliable analysis.", 0
+
+        if mean_intensity > 245:
+            return False, "The uploaded image is too bright or almost blank.", 0
+
+        if std_intensity < 12:
+            return False, "The uploaded image appears blank or has very little visual detail.", 0
+
+        # Check for color/staining patterns commonly seen in blood smear microscopy
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        hue = hsv[:, :, 0]
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+
+        # Blood smear images usually have visible stain/color variation.
+        stained_pixels = (
+            (saturation > 25) &
+            (value > 45) &
+            (
+                (hue < 18) |          # red/pink range
+                (hue > 135) |         # magenta/purple range
+                ((hue > 90) & (hue < 135))  # bluish-purple stain range
+            )
+        )
+
+        stained_ratio = np.mean(stained_pixels)
+
+        # Texture/edge check: microscopy images should not be completely smooth.
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_ratio = np.mean(edges > 0)
+
+        validation_score = 0
+
+        if stained_ratio > 0.04:
+            validation_score += 45
+        elif stained_ratio > 0.015:
+            validation_score += 25
+
+        if edge_ratio > 0.015:
+            validation_score += 35
+        elif edge_ratio > 0.007:
+            validation_score += 20
+
+        if 35 <= mean_intensity <= 235:
+            validation_score += 10
+
+        if std_intensity >= 20:
+            validation_score += 10
+
+        # Conservative threshold: reject only images that clearly do not look like microscopy/blood smear images.
+        if validation_score < 45:
+            return (
+                False,
+                "Invalid image detected. Please upload a clear microscopic blood smear cell image, not a random photo, document, X-ray, selfie, or blank image.",
+                validation_score
+            )
+
+        return True, "Image passed basic blood-smear validation.", validation_score
+
+    except Exception as e:
+        return False, f"Image validation failed: {e}", 0
+
+
 def find_last_conv_layer_name(model):
     """
     Finds a suitable convolutional feature layer for Grad-CAM.
@@ -637,6 +732,10 @@ if model is None:
 if page == "Diagnosis":
     left, right = st.columns([1.1, 1])
 
+    uploaded_file = None
+    image = None
+    image_is_valid_for_gradcam = False
+
     with left:
         st.markdown('<div class="info-card">', unsafe_allow_html=True)
         st.subheader("Upload Blood Smear Image")
@@ -668,8 +767,12 @@ if page == "Diagnosis":
         st.markdown("</div>", unsafe_allow_html=True)
 
         if uploaded_file is not None:
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded Blood Smear Image", use_container_width=True)
+            try:
+                image = Image.open(uploaded_file)
+                st.image(image, caption="Uploaded Image", use_container_width=True)
+            except Exception:
+                image = None
+                st.error("The uploaded file could not be opened as a valid image.")
 
     with right:
         st.markdown('<div class="info-card">', unsafe_allow_html=True)
@@ -677,56 +780,84 @@ if page == "Diagnosis":
 
         if uploaded_file is None:
             st.info("Upload an image to begin malaria screening.")
+
+        elif image is None:
+            st.error("Invalid upload. Please upload a valid JPG, JPEG, or PNG image.")
+
         else:
-            with st.spinner("Analyzing blood smear image..."):
-                time.sleep(1)
-                label, confidence, parasitized_prob, uninfected_prob, raw_prob = predict_malaria(image)
+            is_valid_image, validation_message, validation_score = validate_blood_smear_image(image)
 
-            if label == "Parasitized":
+            if not is_valid_image:
                 st.markdown(
                     f"""
-                    <div class="result-card-positive">
-                        <h2>⚠️ Malaria Parasite Detected</h2>
-                        <h3>Prediction: {label}</h3>
-                        <h3>Confidence: {confidence:.2f}%</h3>
-                        <p>The model detected visual patterns associated with parasitized blood cells.
-                        Immediate confirmatory testing and clinical consultation are recommended.</p>
+                    <div class="result-card-invalid">
+                        <h2>🚫 Invalid Image Detected</h2>
+                        <h3>Prediction not performed</h3>
+                        <p>{validation_message}</p>
+                        <p><b>Validation score:</b> {validation_score}/100</p>
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
+
+                st.info(
+                    "Please upload a microscopic blood smear image similar to the malaria cell images used during model training."
+                )
+
             else:
-                st.markdown(
-                    f"""
-                    <div class="result-card-negative">
-                        <h2>✅ No Parasite Detected</h2>
-                        <h3>Prediction: {label}</h3>
-                        <h3>Confidence: {confidence:.2f}%</h3>
-                        <p>The image was classified as uninfected by the model.
-                        Clinical symptoms should still be considered where malaria is suspected.</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
+                image_is_valid_for_gradcam = True
+
+                with st.spinner("Analyzing blood smear image..."):
+                    time.sleep(1)
+                    label, confidence, parasitized_prob, uninfected_prob, raw_prob = predict_malaria(image)
+
+                if label == "Parasitized":
+                    st.markdown(
+                        f"""
+                        <div class="result-card-positive">
+                            <h2>⚠️ Malaria Parasite Detected</h2>
+                            <h3>Prediction: {label}</h3>
+                            <h3>Confidence: {confidence:.2f}%</h3>
+                            <p>The model detected visual patterns associated with parasitized blood cells.
+                            Immediate confirmatory testing and clinical consultation are recommended.</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown(
+                        f"""
+                        <div class="result-card-negative">
+                            <h2>✅ No Parasite Detected</h2>
+                            <h3>Prediction: {label}</h3>
+                            <h3>Confidence: {confidence:.2f}%</h3>
+                            <p>The image was classified as uninfected by the model.
+                            Clinical symptoms should still be considered where malaria is suspected.</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                st.caption(f"Image validation score: {validation_score}/100")
+
+                st.markdown("### Prediction Probabilities")
+                prob_df = pd.DataFrame({
+                    "Class": ["Parasitized", "Uninfected"],
+                    "Probability (%)": [parasitized_prob, uninfected_prob]
+                })
+                st.bar_chart(prob_df.set_index("Class"))
+
+                save_prediction(
+                    uploaded_file.name,
+                    label,
+                    confidence,
+                    parasitized_prob,
+                    uninfected_prob
                 )
-
-            st.markdown("### Prediction Probabilities")
-            prob_df = pd.DataFrame({
-                "Class": ["Parasitized", "Uninfected"],
-                "Probability (%)": [parasitized_prob, uninfected_prob]
-            })
-            st.bar_chart(prob_df.set_index("Class"))
-
-            save_prediction(
-                uploaded_file.name,
-                label,
-                confidence,
-                parasitized_prob,
-                uninfected_prob
-            )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    if uploaded_file is not None:
+    if uploaded_file is not None and image is not None and image_is_valid_for_gradcam:
         st.markdown("---")
         st.subheader("Explainable AI: Grad-CAM Visualization")
 
@@ -744,6 +875,10 @@ if page == "Diagnosis":
             )
         else:
             st.warning("Grad-CAM could not be generated for this model structure.")
+
+    elif uploaded_file is not None and image is not None and not image_is_valid_for_gradcam:
+        st.markdown("---")
+        st.info("Grad-CAM was not generated because the uploaded image did not pass the blood-smear validation check.")
 
 
 # =========================
