@@ -468,67 +468,84 @@ def find_last_conv_layer_name(model):
 
 def make_gradcam_heatmap(image: Image.Image, model, last_conv_layer_name=None):
     """
-    Robust Grad-CAM for the MobileNetV2 malaria model.
-    It tries MobileNetV2's known final convolutional layers first, then falls back
-    to the last available 4D feature layer. If gradients are weak, it uses the
-    activation map as a fallback so the app still displays an explanation image.
+    Grad-CAM implementation for MobileNetV2-based Keras model.
+    This version fixes the deployed Streamlit error:
+    'list indices must be integers or slices, not tuple'
     """
     img_array = preprocess_image(image)
 
+    # Try common MobileNetV2 final convolutional layers first
+    possible_layers = [
+        "out_relu",
+        "Conv_1_relu",
+        "Conv_1",
+        "block_16_project",
+        "block_15_project"
+    ]
+
     if last_conv_layer_name is None:
-        last_conv_layer_name = find_last_conv_layer_name(model)
+        for layer_name in possible_layers:
+            try:
+                layer = model.get_layer(layer_name)
+                if len(layer.output.shape) == 4:
+                    last_conv_layer_name = layer_name
+                    break
+            except Exception:
+                continue
+
+    # If known names fail, automatically search for the last 4D layer
+    if last_conv_layer_name is None:
+        for layer in reversed(model.layers):
+            try:
+                if len(layer.output.shape) == 4:
+                    last_conv_layer_name = layer.name
+                    break
+            except Exception:
+                continue
 
     if last_conv_layer_name is None:
         return None
 
     try:
-        last_conv_layer = model.get_layer(last_conv_layer_name)
-
+        # Use model.outputs[0], not model.output, to avoid nested list issues
         grad_model = tf.keras.models.Model(
             inputs=model.inputs,
-            outputs=[last_conv_layer.output, model.output]
+            outputs=[
+                model.get_layer(last_conv_layer_name).output,
+                model.outputs[0]
+            ]
         )
 
         with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_array, training=False)
-            probability = predictions[:, 0]
+            conv_outputs, predictions = grad_model(img_array)
 
-            # Class-specific score:
-            # probability >= 0.5 supports Uninfected, probability < 0.5 supports Parasitized.
-            predicted_class_is_uninfected = probability >= 0.5
-            class_score = tf.where(
-                predicted_class_is_uninfected,
-                probability,
-                1.0 - probability
-            )
+            # Fix for Streamlit/Keras list output issue
+            if isinstance(predictions, (list, tuple)):
+                predictions = predictions[0]
 
-        grads = tape.gradient(class_score, conv_outputs)
+            loss = predictions[:, 0]
 
-        if grads is not None:
-            pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-            conv_outputs_single = conv_outputs[0]
-            heatmap = conv_outputs_single @ pooled_grads[..., tf.newaxis]
-            heatmap = tf.squeeze(heatmap).numpy()
-        else:
-            # Fallback: use average activation if gradient graph is unavailable.
-            heatmap = tf.reduce_mean(conv_outputs[0], axis=-1).numpy()
+        grads = tape.gradient(loss, conv_outputs)
+
+        if grads is None:
+            return None
+
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+        conv_outputs = conv_outputs[0]
+        heatmap = tf.reduce_sum(tf.multiply(pooled_grads, conv_outputs), axis=-1)
 
         heatmap = np.maximum(heatmap, 0)
         max_val = np.max(heatmap)
 
-        if max_val == 0 or np.isnan(max_val):
-            # Final fallback: absolute feature activation.
-            heatmap = np.mean(np.abs(conv_outputs[0].numpy()), axis=-1)
-            max_val = np.max(heatmap)
-
-        if max_val == 0 or np.isnan(max_val):
+        if max_val == 0:
             return None
 
         heatmap = heatmap / max_val
-        return heatmap
+        return heatmap.numpy()
 
     except Exception as e:
-        st.caption(f"Grad-CAM debug note: {str(e)[:180]}")
+        st.info(f"Grad-CAM debug note: {e}")
         return None
 
 def overlay_heatmap(image: Image.Image, heatmap, alpha=0.42):
