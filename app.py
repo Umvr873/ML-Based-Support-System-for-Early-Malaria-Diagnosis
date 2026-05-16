@@ -452,79 +452,150 @@ def predict_malaria(image: Image.Image):
 
 def validate_blood_smear_image(image: Image.Image):
     """
-    Basic out-of-scope image validation.
-    This does not replace a dedicated blood-smear detector, but it helps prevent
-    obvious invalid uploads such as selfies, documents, landscapes, dark images,
-    blank images, and grayscale/non-microscopy images.
+    Stronger out-of-scope image validation.
+
+    Important:
+    This is still a heuristic gate, not a separately trained medical-image validator.
+    It rejects obvious non-blood-smear images before the malaria classifier is allowed
+    to make a prediction.
     """
     try:
+        original_w, original_h = image.size
+        aspect_ratio = original_w / max(original_h, 1)
+
+        # Most single-cell malaria dataset images are close to square.
+        # This rejects many selfies, documents, landscapes, and camera photos.
+        if aspect_ratio < 0.70 or aspect_ratio > 1.45:
+            return (
+                False,
+                "Invalid image detected. The image shape does not look like a single-cell microscopic blood smear image.",
+                0
+            )
+
         rgb_img = image.convert("RGB").resize((224, 224))
         img = np.array(rgb_img)
 
-        # Basic image quality checks
-        mean_intensity = np.mean(img)
-        std_intensity = np.std(img)
+        mean_intensity = float(np.mean(img))
+        std_intensity = float(np.std(img))
 
-        if mean_intensity < 25:
-            return False, "The uploaded image is too dark for reliable analysis.", 0
+        if mean_intensity < 35:
+            return False, "The uploaded image is too dark for reliable microscopic analysis.", 0
 
-        if mean_intensity > 245:
+        if mean_intensity > 238:
             return False, "The uploaded image is too bright or almost blank.", 0
 
-        if std_intensity < 12:
-            return False, "The uploaded image appears blank or has very little visual detail.", 0
+        if std_intensity < 18:
+            return False, "The uploaded image appears blank or has very little microscopic detail.", 0
 
-        # Check for color/staining patterns commonly seen in blood smear microscopy
         hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
         hue = hsv[:, :, 0]
         saturation = hsv[:, :, 1]
         value = hsv[:, :, 2]
 
-        # Blood smear images usually have visible stain/color variation.
+        # Blood smear images usually have pale background plus pink/purple/blue stain.
         stained_pixels = (
             (saturation > 25) &
             (value > 45) &
             (
-                (hue < 18) |          # red/pink range
-                (hue > 135) |         # magenta/purple range
-                ((hue > 90) & (hue < 135))  # bluish-purple stain range
+                (hue < 18) |                 # red / pink
+                (hue > 135) |                # magenta / purple
+                ((hue > 85) & (hue < 135))   # blue-purple stain
             )
         )
 
-        stained_ratio = np.mean(stained_pixels)
+        stained_ratio = float(np.mean(stained_pixels))
+        pale_background_ratio = float(np.mean((saturation < 70) & (value > 120)))
 
-        # Texture/edge check: microscopy images should not be completely smooth.
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        edge_ratio = np.mean(edges > 0)
-
-        validation_score = 0
-
-        if stained_ratio > 0.04:
-            validation_score += 45
-        elif stained_ratio > 0.015:
-            validation_score += 25
-
-        if edge_ratio > 0.015:
-            validation_score += 35
-        elif edge_ratio > 0.007:
-            validation_score += 20
-
-        if 35 <= mean_intensity <= 235:
-            validation_score += 10
-
-        if std_intensity >= 20:
-            validation_score += 10
-
-        # Conservative threshold: reject only images that clearly do not look like microscopy/blood smear images.
-        if validation_score < 45:
+        # Reject images with almost no stain colour or no light microscope-like background.
+        if stained_ratio < 0.020:
             return (
                 False,
-                "Invalid image detected. Please upload a clear microscopic blood smear cell image, not a random photo, document, X-ray, selfie, or blank image.",
+                "Invalid image detected. The uploaded image does not contain enough blood-smear stain colour.",
+                0
+            )
+
+        if pale_background_ratio < 0.20:
+            return (
+                False,
+                "Invalid image detected. The background does not look like a microscope blood smear field.",
+                0
+            )
+
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        # Edge/texture check.
+        edges = cv2.Canny(gray, 40, 140)
+        edge_ratio = float(np.mean(edges > 0))
+
+        if edge_ratio < 0.006:
+            return (
+                False,
+                "Invalid image detected. The image does not contain enough cell-like microscopic texture.",
+                0
+            )
+
+        # Cell-like object check using contours.
+        # This helps reject documents, random photos, screenshots, and smooth backgrounds.
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        adaptive = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            4
+        )
+
+        contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        cell_like_count = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 120 or area > 18000:
+                continue
+
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
+                continue
+
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+
+            x, y, w, h = cv2.boundingRect(cnt)
+            box_ratio = w / max(h, 1)
+
+            if 0.18 <= circularity <= 1.35 and 0.45 <= box_ratio <= 2.20:
+                cell_like_count += 1
+
+        # Scoring system.
+        validation_score = 0
+
+        if 0.04 <= stained_ratio <= 0.70:
+            validation_score += 30
+        elif stained_ratio >= 0.02:
+            validation_score += 15
+
+        if pale_background_ratio >= 0.35:
+            validation_score += 25
+        elif pale_background_ratio >= 0.20:
+            validation_score += 10
+
+        if edge_ratio >= 0.015:
+            validation_score += 20
+        elif edge_ratio >= 0.006:
+            validation_score += 10
+
+        if cell_like_count >= 1:
+            validation_score += 25
+
+        # Strict gate: prediction is blocked unless image looks reasonably like a stained cell image.
+        if validation_score < 70 or cell_like_count < 1:
+            return (
+                False,
+                "Invalid image detected. Please upload a clear microscopic blood smear cell image. Random photos, documents, screenshots, X-rays, or non-cell images are not accepted.",
                 validation_score
             )
 
-        return True, "Image passed basic blood-smear validation.", validation_score
+        return True, "Image passed blood-smear validation.", validation_score
 
     except Exception as e:
         return False, f"Image validation failed: {e}", 0
@@ -743,7 +814,7 @@ if page == "Diagnosis":
             """
             <div class="upload-panel">
                 <h3>📤 Upload Microscopic Blood Smear Image</h3>
-                <p>Accepted formats: JPG, JPEG, or PNG. Use a clear single-cell blood smear image for best results.</p>
+                <p>Accepted formats: JPG, JPEG, or PNG. The system now rejects non-microscope images before prediction.</p>
             </div>
             """,
             unsafe_allow_html=True
@@ -801,7 +872,7 @@ if page == "Diagnosis":
                 )
 
                 st.info(
-                    "Please upload a microscopic blood smear image similar to the malaria cell images used during model training."
+                    "Please upload a valid microscopic blood smear image."
                 )
 
             else:
