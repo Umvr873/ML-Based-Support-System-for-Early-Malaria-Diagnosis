@@ -542,12 +542,16 @@ def make_gradcam_heatmap(image: Image.Image, model, last_conv_layer_name=None):
             return None
 
         heatmap = heatmap / max_val
-        return heatmap.numpy()
+
+        if hasattr(heatmap, "numpy"):
+            return heatmap.numpy()
+
+        return heatmap
 
     except Exception as e:
         st.info(f"Grad-CAM debug note: {e}")
         return None
-
+    
 def overlay_heatmap(image: Image.Image, heatmap, alpha=0.42):
     image = image.convert("RGB")
     original = np.array(image)
